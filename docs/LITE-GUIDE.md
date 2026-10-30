@@ -18,10 +18,10 @@ Portal with a camera. Panels vary a little, so tell us how it looks on yours.
 
 ## How it dims
 
-Below about 20% brightness the panel itself goes green. OLED Tint keeps the
-real backlight just above that range and darkens the picture instead
-(**Floor dimming**, on by default): the brightness slider works as usual, the
-screen stays neutral. Below the very bottom of the slider the panel's own
+Across the lower part of the brightness slider (roughly 6-38%, worst around
+20%) the panel itself goes green. OLED Tint keeps the real backlight just above
+that range and darkens the picture instead (**Floor dimming**, on by default):
+the brightness slider works as usual, the screen stays neutral. Below the very bottom of the slider the panel's own
 backlight takes over again. The method can be switched under **Advanced**
 (**Dither correction**, experimental).
 

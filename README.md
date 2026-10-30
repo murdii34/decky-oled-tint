@@ -1,5 +1,7 @@
 # OLED Tint
 
+![OLED Tint: the dark end of a grey ramp, green and glowing on the bare panel, neutral with OLED Tint](assets/store.png)
+
 A Decky Loader plugin that fixes the AYN Odin 2 Portal's OLED at low
 brightness: the green cast and the glowing near-black that make the bottom
 half of the brightness range hard to use. Built on Armada OS (gamescope with
