@@ -1,0 +1,11 @@
+{
+  "name": "OLED Tint",
+  "author": "murdii",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["display", "oled", "color"],
+    "description": "Fixes the Odin 2 Portal OLED's green, too-bright darks at low brightness: dims in the shader above the panel's bad band (floor dimming), with per-brightness colour calibration.",
+    "image": "https://opengraph.githubassets.com/1/SteamDeckHomebrew/PluginLoader"
+  }
+}
