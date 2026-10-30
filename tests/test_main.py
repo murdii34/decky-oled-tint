@@ -498,6 +498,64 @@ class AynStyle(unittest.TestCase):
             p._refresh()
             self.assertEqual(p.soft_now, 1.0)
 
+    def test_handover_is_a_technique_switch_both_ways(self):
+        # RESULTS 32 (video, 2026-10-30): slider 4% -> 5% (native 53 -> floor
+        # dimming) flashed undimmed 543 for 130 ms-1 s, 5% -> 4% blacked out:
+        # the crossing needed a new effect (native curves vs the floor's) and
+        # waited for the compile throttle while the backlight had moved.
+        with tempfile.TemporaryDirectory() as tmp:
+            p = make_plugin(tmp, engine="reshade")
+            p.settings.update(dimming="soft", soft_target=53)
+            raw = [53]
+            p._read_brightness = lambda: raw[0]
+            p._refresh()                                # native bottom: the floor's effect, passing through
+            self.assertIsNotNone(p.applied)
+            self.assertFalse(p._soft_dimmed())
+            self.assertEqual(p.applied[0][5], ("L", m.PASS_TECH))
+            name, files = p.applied[1][m.RESHADE_ATOM], set(os.listdir(p.fx_dir))
+            p.settings["soft_target"] = 57              # up: dimmed first, still at 53 ...
+            p._refresh()
+            dim = ("L", m.gain_index(m.soft_gain(57, m.SOFT_FLOOR)))
+            self.assertEqual(p.applied[0][5], dim)
+            self.assertTrue(p._soft_dimmed())          # the frontend may raise the backlight now
+            raw[0] = m.SOFT_FLOOR                       # ... then the frontend raises the backlight
+            p._refresh()
+            self.assertEqual(p.applied[0][5], dim)
+            p.settings["soft_target"] = 53              # down: the backlight drops ...
+            raw[0] = 53
+            p._refresh()
+            self.assertEqual(p.applied[0][5], ("L", m.PASS_TECH))   # ... and the dimming lets go
+            self.assertEqual(p.applied[1][m.RESHADE_ATOM], name)    # never a new effect: no compile
+            self.assertEqual(set(os.listdir(p.fx_dir)), files)
+
+    def test_pass_technique_leaves_the_picture_alone(self):
+        fx = m.build_fx((m._neutral(),) * len(m.KINDS), gain=None)
+        self.assertEqual(fx.count("technique G"), m.GAIN_STEPS)
+        self.assertEqual(m.PASS_TECH, m.GAIN_STEPS)             # the technique after the ladder
+        self.assertTrue(fx.rstrip().endswith("technique Pass { pass { VertexShader = VS; PixelShader = PSPass; } }"))
+        self.assertIn("{ return float4(tex2D(ReShade::BackBuffer, uv).rgb, 1.0); }", fx)
+        self.assertNotIn("technique Pass", m.build_fx((m._neutral(),) * len(m.KINDS)))
+
+    def test_handover_down_passes_through_before_the_backlight_drops(self):
+        # gamescope shows a technique switch ~3-4 frames after the atom, the
+        # backlight follows within ~1: waiting for the drop blacked out for
+        # 3-5 frames (stairs-video-t2). The pass-through goes first now.
+        with tempfile.TemporaryDirectory() as tmp:
+            p = make_plugin(tmp, engine="reshade")
+            p.settings.update(dimming="soft", soft_target=57)
+            p._save_settings = lambda: None
+            p.wake = asyncio.Event()
+            p._read_brightness = lambda: m.SOFT_FLOOR      # still at the floor
+            p._refresh()
+            self.assertEqual(p.applied[0][5], ("L", m.gain_index(m.soft_gain(57, m.SOFT_FLOOR))))
+            name = p.applied[1][m.RESHADE_ATOM]
+            asyncio.run(p.set_soft_target(53, "down"))
+            self.assertEqual(p.applied[0][5], ("L", m.PASS_TECH))
+            self.assertEqual(p.applied[1][m.RESHADE_ATOM], name)
+            p.down_until = 0.0                              # the hint over, the backlight still up:
+            p._refresh()                                    # back to the floor's own picture
+            self.assertTrue(p.applied is None or p.applied[0][5] != ("L", m.PASS_TECH))
+
     def test_unsupported_device_pauses(self):
         with tempfile.TemporaryDirectory() as tmp:
             bl = os.path.join(tmp, "bl")

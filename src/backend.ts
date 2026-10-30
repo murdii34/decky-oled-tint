@@ -204,7 +204,9 @@ export const ownWrite = { at: 0 };
 
 export const setDimming = callable<[mode: "band" | "soft", target: number], State>("set_dimming");
 export const sliderLog = callable<[line: string], boolean>("slider_log");
-export const setSoftTarget = callable<[target: number], State>("set_soft_target");
+// handover: "up" dims for the floor at once (call before raising the backlight),
+// "down" lets the dimming go once the backlight has dropped (RESULTS 32).
+export const setSoftTarget = callable<[target: number, handover?: "up" | "down"], State>("set_soft_target");
 export const setBandSnap = callable<[on: boolean], State>("set_band_snap");
 export const setGameOff = callable<[on: boolean, name: string], State>("set_game_off");
 export const compare = callable<[seconds: number], State>("compare");

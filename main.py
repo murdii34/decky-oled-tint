@@ -653,6 +653,18 @@ def _slider_log(msg):
 
 GAIN_RATIO = 1.02
 GAIN_STEPS = 152         # 1.0 .. ~0.05 of the light, ~2% per step
+# After the ladder: a technique that leaves the picture alone. Below the band
+# floor dimming keeps its effect on screen on this one, so the hand-over to the
+# floor and back is a technique switch, not a new effect: the compile throttle
+# made it flash undimmed 543 for up to 1 s going up and black out going down
+# (RESULTS 32).
+PASS_TECH = GAIN_STEPS
+PASS = "pass"            # the gain that selects it
+# Hand-over down: the pass-through goes on screen before the frontend drops
+# the backlight (gamescope shows a technique switch ~3-4 frames after the
+# atom, the backlight follows Steam's call within ~1), so for this long the
+# backlight counts as already below the band.
+HANDOVER_WAIT = 1.0
 
 
 def gain_index(gain):
@@ -694,6 +706,9 @@ def build_fx(curves, crush=0, dither=None, gain=1.0):
             f"{{ return Shade(pos, uv, {GAIN_RATIO ** (-k / 2.2):.6f}); }}\n"
             f"technique G{k} {{ pass {{ VertexShader = VS; PixelShader = PS{k}; }} }}\n"
             for k in range(GAIN_STEPS))
+        techniques += ("float4 PSPass(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target "
+                       "{ return float4(tex2D(ReShade::BackBuffer, uv).rgb, 1.0); }\n"
+                       "technique Pass { pass { VertexShader = VS; PixelShader = PSPass; } }\n")
     else:
         techniques = ("float4 PS(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target "
                       "{ return Shade(pos, uv, 1.0); }\n"
@@ -1651,9 +1666,11 @@ class Plugin:
         return f"{FX_PREFIX}{h.hexdigest()[:20]}.fx"
 
     def _apply(self, curves, engine=None, sdr_only=False, gain=1.0):
-        """gain: the whole picture's light scaled by it (floor dimming dimming)."""
+        """gain: the whole picture's light scaled by it (floor dimming dimming);
+        PASS: the ladder's pass-through technique."""
         engine = engine or self.settings.get("engine", "reshade")
-        gain = round(gain, 3)
+        passthru = gain == PASS
+        gain = 1.0 if passthru else round(gain, 3)
         # Both looks also while calibrating: with HDR output gamescope shows
         # SDR content (Steam's UI too) through the PQ one, so an SDR-only
         # preview showed the old PQ table.
@@ -1681,7 +1698,7 @@ class Plugin:
         # effect (see GAIN_RATIO), switched without a compile.
         ladder = engine == "reshade" and self.settings.get("dimming") == "soft" and (
                 dither is None or dither["w"] == 0.0)
-        tech = gain_index(gain) if ladder else 0
+        tech = (PASS_TECH if passthru else gain_index(gain)) if ladder else 0
         key = (tuple(tuple(round(t, 1) for t in c) for c in curves), engine, sdr_only, crush, dkey,
                ("L", tech) if ladder else gain)
         if ladder and self.preview is None and self.applied and self.applied[0][:-1] == key[:-1] \
@@ -1828,19 +1845,31 @@ class Plugin:
         # floor dimming: the backlight held at the floor (by the frontend), the
         # picture dimmed to the requested level.
         self.soft_now = 1.0
+        self.soft_pass = False
         target = self.settings.get("soft_target")
-        if (self.settings.get("dimming") == "soft" and not shown and raw and target
-                and raw >= floor_of(self.settings) * 0.97 and soft_wanted(target, floor_of(self.settings))):
+        floor = floor_of(self.settings)
+        soft = self.settings.get("dimming") == "soft" and not shown and raw
+        going_down = time.monotonic() < getattr(self, "down_until", 0.0)
+        below = soft and (raw < SNAP_ZONE[0] or going_down) \
+            and self.settings.get("engine", "reshade") == "reshade" and not self._app_effect()
+        if soft and target and soft_wanted(target, floor) and raw >= floor * 0.97 and not going_down:
             # Dimmed from wherever the backlight is, as long as it's above
             # the band: with Steam's slider intercepted the last request that
             # got through can leave it at e.g. 560, not exactly the floor
             # (nothing was dimmed then).
             self.soft_now = round(soft_gain(target, raw), 3)
+        elif below and target and soft_wanted(target, floor):
+            # On the way up from below the band: dimmed for the floor before
+            # the frontend raises the backlight to it (a dip, never the flash
+            # of the floor undimmed: RESULTS 32).
+            self.soft_now = round(soft_gain(target, floor), 3)
+        elif below:
+            self.soft_pass = True   # the floor's effect stays, passing through
         # While floor dimming holds the panel at the floor, the colour correction
         # is the floor's: taken from the backlight passing by on its way down,
         # every bin of the ramp was a new effect to compile (4 in 6 s, found by
         # the UI smoke test 2026-10-30); a slider drag stuttered.
-        curves = self._target(self._bin(floor_of(self.settings)) if self.soft_now < 1.0 else b)
+        curves = self._target(self._bin(floor) if self.soft_now < 1.0 or self.soft_pass else b)
         self.current, self.current_l, self.current_h = curves or (_neutral(),) * len(KINDS)
         if self.conflict:
             # Another look (e.g. a Steam colour filter) is active; stay out of
@@ -1861,7 +1890,7 @@ class Plugin:
             self.app_on = None
             self.applied = None
         idle = curves is not None and max(abs(t) for c in curves for t in c) < 0.05 \
-            and getattr(self, "soft_now", 1.0) == 1.0
+            and getattr(self, "soft_now", 1.0) == 1.0 and not getattr(self, "soft_pass", False)
         if idle and (self.settings.get("crush", 0) or (
                 self.settings.get("dither") and dither_weight(self.settings.get("dither_tables"), self.backlight_now,
                                                               getattr(self, "backlight_raw", None))[0])):
@@ -1885,7 +1914,7 @@ class Plugin:
             # Both looks, also for menus: the output runs in HDR, where
             # gamescope uses the PQ look for SDR content too (writing only the
             # G22 one left the menus and Steam's UI uncorrected, green).
-            self._apply(curves, "look" if app or self._menu_engine() else None, gain=getattr(self, "soft_now", 1.0))
+            self._apply(curves, "look" if app or self._menu_engine() else None, gain=PASS if getattr(self, "soft_pass", False) else getattr(self, "soft_now", 1.0))
         # On screen and dithering: our ReShade effect, built with a dither.
         self.dithering = bool(self.applied and self.applied[0][1] == "reshade" and self.applied[0][4])
         self._sync_vibrance()
@@ -1970,6 +1999,7 @@ class Plugin:
             "soft_target": self.settings.get("soft_target"),
             "soft_floor": floor_of(self.settings),
             "soft_gain": getattr(self, "soft_now", 1.0),
+            "soft_dimmed": self._soft_dimmed(),
             "snap_zone": list(SNAP_ZONE),
             "safe_mode": getattr(self, "safe_mode", False),
             "dither_ui": self.settings.get("dither_ui", True),
@@ -2217,10 +2247,25 @@ class Plugin:
         self.wake.set()
         return await self.get_state()
 
-    async def set_soft_target(self, target: int):
+    def _soft_dimmed(self):
+        """The floor dimming's gain for the current target is on screen (the
+        frontend raises the backlight to the floor only then: RESULTS 32)."""
+        gain = getattr(self, "soft_now", 1.0)
+        return bool(gain < 1.0 and self.applied and not getattr(self, "deferred", False)
+                    and self.applied[0][-1] == ("L", gain_index(gain)))
+
+    async def set_soft_target(self, target: int, handover: str = None):
+        """handover (the frontend crossing the band's bottom edge, RESULTS 32):
+        "up": dim for the floor now, before the frontend raises the backlight;
+        "down": pass through now, before the frontend drops the backlight.
+        Both act at once instead of in the next loop round; the frontend
+        moves the backlight a lead time later (gamescope's switch is slower)."""
         self.settings["soft_target"] = max(1, int(target))
         self._save_settings()
         self.fast_until = asyncio.get_event_loop().time() + 3
+        self.down_until = time.monotonic() + HANDOVER_WAIT if handover == "down" else 0.0
+        if handover in ("up", "down"):
+            self._refresh()
         self.wake.set()
         return await self.get_state()
 

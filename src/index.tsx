@@ -397,13 +397,72 @@ function showOnSlider(f: number) {
   }
 }
 
+// Crossing the band's bottom edge (slider 4% <-> 5%): backlight and dimming
+// change together (RESULTS 32: the backlight ran ahead of the dimming, 543
+// undimmed for up to 1 s going up, a blackout going down). Filmed
+// (handover_sweep.py, 2026-10-30): the technique switch shows fast, the
+// backlight a little later, and the two jitter by 1-2 frames, so they can't be
+// made to meet exactly. Ordered so the leftover is always a short dip, never
+// a flash: up, the dimming goes first and the backlight rises HANDOVER_LEAD ms
+// after; down, the backlight drops first and the dimming lets go
+// HANDOVER_LAG ms after.
+const HANDOVER_LEAD = 80;
+const HANDOVER_LAG = 60;
+// Camera runs can try other values without a build.
+const handoverLead = (): number => (window as any).OLED_HANDOVER_LEAD ?? HANDOVER_LEAD;
+const handoverLag = (): number => (window as any).OLED_HANDOVER_LAG ?? HANDOVER_LAG;
+function crossUp(f: number) {
+  clearTimeout(softSend.timer);
+  ayn.floorAt = Date.now(); // ensureFloor stays out of it
+  ownWrite.at = Date.now();
+  const rise = () => {
+    if (!ayn.on) return;
+    ownWrite.at = Date.now();
+    ayn.floorAt = Date.now();
+    setDirect(guess(ayn.floor));
+    setTimeout(() => ayn.on && showOnSlider(f), 120);
+    setTimeout(() => ayn.on && showOnSlider(f), 400);
+  };
+  // Only once the backend says the dimming is on screen (its effect may still
+  // be waiting for the compile throttle); after 1.5 s the backlight rises anyway.
+  const until = Date.now() + 1500;
+  const ask = () =>
+    setSoftTarget(ayn.target, "up").then(
+      (st: any) => {
+        if (!atFloor(ayn.target)) return; // back below meanwhile: the backlight stays
+        if (st?.soft_dimmed || Date.now() > until) setTimeout(() => atFloor(ayn.target) && rise(), handoverLead());
+        else setTimeout(ask, 100);
+      },
+      () => atFloor(ayn.target) && rise(),
+    );
+  ask();
+}
+
+// Down: the backlight drops first, the backend passes through after the lag.
+function crossDown(raw: number, f: number) {
+  clearTimeout(softSend.timer);
+  setDirect(f);
+  setTimeout(() => setSoftTarget(raw, "down").catch(() => {}), handoverLag());
+}
+
+const atFloor = (t: number) => t >= SOFT_FROM && t < ayn.floor;
+const belowBand = (t: number) => t > 0 && t < SOFT_FROM;
+
 function aynIntercept(f: number): boolean {
   if (!ayn.on || demoTimer) return false;
   const raw = rawFor(f);
   cancelBrightness();
   clearTimeout(ayn.pending);
+  const was = ayn.target;
   if (raw >= SOFT_FROM && raw < ayn.floor) {
     ayn.holding = false;
+    if (belowBand(was)) {
+      ayn.target = raw;
+      showOnSlider(f);
+      ayn.lastF = f;
+      crossUp(f);
+      return true; // swallowed: crossUp raises the backlight once dimmed
+    }
     ayn.target = raw;
     softPush(raw);
     ownWrite.at = Date.now();
@@ -432,12 +491,17 @@ function aynIntercept(f: number): boolean {
       ayn.holding = false;
       if (!ayn.on) return;
       ayn.target = raw;
-      softPush(raw);
+      if (atFloor(was) && belowBand(raw)) return crossDown(raw, f);
       setDirect(f);
+      softPush(raw);
     }, 60);
     return true;
   }
   ayn.target = raw;
+  if (atFloor(was) && belowBand(raw)) {
+    crossDown(raw, f);
+    return true; // swallowed: crossDown drops the backlight itself
+  }
   softPush(raw);
   return false;
 }
