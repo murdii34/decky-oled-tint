@@ -719,13 +719,16 @@ function DemoToggle() {
 }
 
 function Brightness({ brightness }: { brightness: number | null }) {
+  // Steam's slider position (what its own brightness slider shows), next to
+  // the panel level: people troubleshoot in percent.
+  const percent = Math.round(guess(brightness ?? 40) * 100);
   return (
     <>
       <PanelSectionRow>
         <SliderField
-          label={`Brightness ${brightness ?? "?"}`}
+          label={brightness == null ? "Brightness ?" : `Brightness ${brightness} · ${percent}%`}
           bottomSeparator="none" // the presets below belong to it; the line goes under them
-          value={Math.round(guess(brightness ?? 40) * 100)}
+          value={percent}
           min={0}
           max={100}
           step={1}
