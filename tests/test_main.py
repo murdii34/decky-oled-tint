@@ -1237,10 +1237,13 @@ class Dither(unittest.TestCase):
                 self.assertTrue(p._menu_engine())
                 p.settings["menu_correction"] = False
                 self.assertFalse(p._menu_engine())          # toggle off: never
+                self.assertFalse(p.menu_look)               # and not held for later (review 10-31 #3)
                 p.settings["menu_correction"] = True
                 # The menu over a game hands the focus to Steam's UI: still the game.
                 p.focused, p.focus_since = m.STEAM_UI_APP, clock[0] + 0.2
                 clock[0] += 1.0
+                self.assertFalse(p._menu_engine())          # back on: a switch, rate limited
+                clock[0] += m.ENGINE_SWITCH_GAP
                 self.assertTrue(p._menu_engine())
                 # Steam's UI in front before the menu opened: its own menus, ReShade covers them.
                 asyncio.run(p.set_overlay(False))
@@ -1761,6 +1764,161 @@ class PreviewTimeout(unittest.TestCase):
                 task.cancel()
                 return p.preview
         self.assertIsNone(asyncio.run(run()))
+
+
+class Review20261031(unittest.TestCase):
+    """docs/reviews/2026-10-31-correctness-review.md"""
+
+    def _held_by_the_menu(self, tmp):
+        # Dither correction, a game, Quick Access open long enough: the
+        # correction is on the look, Steam's vibrance (0.5) held at 1.0.
+        p = make_plugin(tmp, engine="reshade")
+        p.wake = types.SimpleNamespace(set=lambda: None)
+        for step in p.settings["steps"]:
+            step["v"][0] = -40
+        p.focused = "12345"
+        p.overlay_open, p.overlay_since, p.overlay_seen = True, 0.0, time.monotonic()
+        p.menu_look = True
+        p.engine_switched = 0.0
+        p.settings["vibrance_saved"] = "1056964608"
+        p.vibrance_now = p.helper.atoms[m.VIBRANCE_ATOM] = m.VIBRANCE_NATIVE
+        p._read_brightness = lambda: 177
+        p._refresh()
+        self.assertEqual(p.applied[0][1], "look")
+        self.assertEqual(p.vibrance_now, m.VIBRANCE_NATIVE)
+        return p
+
+    def test_3_vibrance_given_back_when_the_menu_look_stops_counting(self):
+        for leave in ("floor dimming", "menu correction off", "safe mode"):
+            with self.subTest(leave), tempfile.TemporaryDirectory() as tmp:
+                p = self._held_by_the_menu(tmp)
+                if leave == "floor dimming":
+                    p.settings.update(dimming="soft", soft_target=100)
+                elif leave == "menu correction off":
+                    p.settings["menu_correction"] = False
+                else:
+                    p.safe_mode = True
+                p._refresh()
+                self.assertFalse(p.menu_look)
+                self.assertEqual(p.vibrance_now, "1056964608")
+                self.assertNotIn("vibrance_saved", p.settings)
+
+    def test_4_unreadable_settings_file_isnt_overwritten(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = make_plugin(tmp)
+            good = {"enabled": True, "profile": "Cam", "profiles": {"Cam": p.settings["steps"]},
+                    "steps": p.settings["steps"], "dither_tables": {"177": pedestal_table()}}
+            bad = json.dumps(good, indent=2).replace('"enabled": true,', '"enabled": true,,')
+            _write(p.settings_path, bad)                    # a hand edit, one stray comma
+            p._load_settings()
+            asyncio.run(p.set_simple(True))                 # any setter saves
+            self.assertEqual(_read(p.settings_path), bad)
+            self.assertEqual(p._status()["state"], "paused")
+            self.assertIn("settings.json", p._status()["text"])
+            # Fixed by hand: read again, saved again.
+            time.sleep(0.01)
+            _dump(good, p.settings_path)
+            p._load_settings()
+            self.assertEqual(p.settings["profile"], "Cam")
+            asyncio.run(p.set_simple(True))
+            self.assertTrue(_load(p.settings_path)["simple"])
+            self.assertIn("177", _load(p.settings_path)["dither_tables"])
+            # Deleted instead: nothing left to protect, saving works.
+            _write(p.settings_path, "{")
+            os.utime(p.settings_path, (1, 1))
+            p._load_settings()
+            os.remove(p.settings_path)
+            p._load_settings()
+            asyncio.run(p.set_simple(False))
+            self.assertFalse(_load(p.settings_path)["simple"])
+
+    def test_5_handover_up_from_inside_the_band_dims_first(self):
+        # Floor dimming coming back on (or after Compare) with the backlight
+        # left at the target, 177: the frontend raises it only once the
+        # dimming for the floor is on screen. That only ever happened from
+        # below the band, so the backlight rose undimmed after 1.5 s.
+        with tempfile.TemporaryDirectory() as tmp:
+            p = make_plugin(tmp, engine="reshade")
+            p.settings.update(dimming="soft", soft_target=177)
+            p._save_settings = lambda: None
+            p.wake = asyncio.Event()
+            raw = [177]
+            p._read_brightness = lambda: raw[0]
+            p._refresh()
+            self.assertEqual(p.soft_now, 1.0)               # left alone: nobody raises it
+            st = asyncio.run(p.set_soft_target(177, "up"))
+            dim = ("L", m.gain_index(m.soft_gain(177, m.SOFT_FLOOR)))
+            self.assertEqual(p.applied[0][5], dim)
+            self.assertTrue(st["soft_dimmed"])              # the frontend may raise it now
+            asyncio.run(p.set_soft_target(170))             # a slider push meanwhile: still dimmed for the floor
+            p._refresh()                                    # (the loop's round it wakes)
+            self.assertEqual(p.applied[0][5], ("L", m.gain_index(m.soft_gain(170, m.SOFT_FLOOR))))
+            raw[0] = m.SOFT_FLOOR                           # raised
+            p._refresh()
+            self.assertEqual(p.applied[0][5], ("L", m.gain_index(m.soft_gain(170, m.SOFT_FLOOR))))
+            # Never raised (the frontend went away): the hint runs out.
+            raw[0] = 177
+            asyncio.run(p.set_soft_target(177, "up"))
+            p.up_until = 0.0
+            p._refresh()
+            self.assertEqual(p.soft_now, 1.0)
+
+    def test_1_game_off_keeps_the_dimming_until_the_backlight_drops(self):
+        # An "off" game comes to the front with the backlight at the floor: the
+        # backend took the effect off at once, the frontend dropped the backlight
+        # up to 2 s later (its poll): the floor undimmed meanwhile, ~2x the
+        # light asked for at 177. Now the dimming waits for the drop (as crossDown).
+        with tempfile.TemporaryDirectory() as tmp:
+            p = make_plugin(tmp, engine="reshade")
+            p.settings.update(dimming="soft", soft_target=177, app_off={"12345": "Game"})
+            raw = [m.SOFT_FLOOR]
+            p._read_brightness = lambda: raw[0]
+            p.focused = "999"                               # another game: dimmed at the floor
+            p._refresh()
+            dim = p.applied[0][5]
+            self.assertEqual(dim, ("L", m.gain_index(m.soft_gain(177, m.SOFT_FLOOR))))
+            p.focused = "12345"                             # the "off" one
+            p._refresh()
+            self.assertEqual(p.applied[0][5], dim)          # still dimmed: the backlight is still up
+            self.assertFalse(asyncio.run(p.get_snap())["active"])   # the frontend drops it ...
+            raw[0] = 177
+            p._refresh()
+            self.assertIsNone(p.applied)                    # ... then the effect goes
+            # Never dropped (no frontend): let go after LET_GO_WAIT anyway.
+            p.focused, raw[0] = "999", m.SOFT_FLOOR
+            p._refresh()
+            p.focused = "12345"
+            p._refresh()
+            self.assertIsNotNone(p.applied)
+            p.letgo_from -= m.LET_GO_WAIT
+            p._refresh()
+            self.assertIsNone(p.applied)
+            p._refresh()
+            self.assertIsNone(p.applied)                    # and stays off
+
+    def test_1_starting_off_at_the_floor_dims_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = make_plugin(tmp, engine="reshade")
+            p.settings.update(dimming="soft", soft_target=177, enabled=False)
+            p._read_brightness = lambda: m.SOFT_FLOOR
+            p._refresh()
+            self.assertIsNone(p.applied)
+
+    def test_2_snap_says_not_active_while_comparing(self):
+        # The frontend drops the backlight to the target for the comparison
+        # and raises it again after: Compare shows the panel at the asked-for
+        # brightness, not the floor undimmed (4x the light at target 100).
+        with tempfile.TemporaryDirectory() as tmp:
+            p = make_plugin(tmp, engine="reshade")
+            p.settings.update(dimming="soft", soft_target=100)
+            p.wake = asyncio.Event()
+            snap = asyncio.run(p.get_snap())
+            self.assertTrue(snap["active"])
+            self.assertEqual(snap["soft_target"], 100)      # the backend's: a camera run sets it in the file
+            asyncio.run(p.compare(5))
+            self.assertFalse(asyncio.run(p.get_snap())["active"])
+            p.compare_until = 0.0
+            self.assertTrue(asyncio.run(p.get_snap())["active"])
 
 
 class Helper(unittest.TestCase):

@@ -3,7 +3,8 @@ import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
 import { Swatch, grey, ui } from "./Calibrate";
-import { State, getState, setDither, setDitherTemporal, setEnabled, setRawBrightness } from "./backend";
+import { State, getState, setDither, setDitherTemporal, setRawBrightness, switchEnabled } from "./backend";
+import pkg from "../package.json";
 
 export const PATTERN_ROUTE = "/oled-tint/pattern";
 
@@ -57,7 +58,7 @@ export function TestPattern() {
         } else if (b === GamepadButton.BUMPER_LEFT) go(preset < 0 ? 0 : preset - 1);
         else if (b === GamepadButton.BUMPER_RIGHT) go(preset + 1);
         else if (b === GamepadButton.OPTIONS && state && !evt.detail.is_repeat)
-          setEnabled(!state.enabled).then(setState);
+          switchEnabled(!state.enabled).then(setState);
         else if (b === GamepadButton.SECONDARY && state?.dither_ready && !evt.detail.is_repeat)
           setDither(!state.dither).then(setState);
         else if (b === GamepadButton.TRIGGER_RIGHT && state?.dither && !evt.detail.is_repeat)
@@ -79,6 +80,9 @@ export function TestPattern() {
         outline: "none",
       }}
     >
+      {/* The version, big and pure white: readable in a dim, blurry phone
+          photo, so a sent picture says which build it shows. */}
+      <div style={{ color: "#fff", fontSize: "40px", fontWeight: 700, lineHeight: "44px" }}>OLED Tint v{pkg.version}</div>
       <div style={{ display: "flex", justifyContent: "space-between", color: ui(60), fontSize: "15px" }}>
         <span>
           Brightness {state?.brightness ?? "?"} ·{" "}

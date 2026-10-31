@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build an installable "OLED Tint (Lite)" zip: the plugin with a bundled
-# profile (the panel opens with its groups folded). Install with Decky's
+# profile (the panel opens in Simple view). Install with Decky's
 # developer mode -> "Install plugin from ZIP".
 #   scripts/package-lite.sh [profile name] [settings file]
 set -e
@@ -20,7 +20,7 @@ d = json.load(open(src))
 steps = d["profiles"][name]
 shared = f"{name} (shared)"
 # The panel tables come along but the dither starts off: they're measured on
-# this panel, and another one may differ (switch it on under "Show advanced").
+# this panel, and another one may differ (switch it on under Advanced, Simple view off).
 tables = d.get("dither_tables") or {}
 json.dump({"enabled": True, "engine": "reshade", "simple": True, "crush": 0, "dither": False,
            "dither_temporal": "pair", "shadow_curve": d.get("shadow_curve", "g22"), "menu_correction": True,

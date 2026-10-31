@@ -59,7 +59,8 @@ while a game runs. Two folded groups, remembered per device:
   Gamma 2.2), crush, and the date the panel tables were measured.
 - **Demo:** Sweep (the brightness glides around the band, 50-1000, or the full range, 40-4096; the speed set as 15 s to 10 min per sweep around the band, the full range at that speed takes ~1.5x as long; 15 s on purpose faster than the correction) or Before / after (96, 177, 230, 310 in turn, corrected then uncorrected, 2-10 s each); optional stop after minutes or cycles.
 - **Dimming** (main page): **Floor dimming** (the default) holds the backlight at 543, just above the bad band, and darkens the picture in the shader to the light the requested brightness would give (from the measured white curve, a flat gain, no dither); a brightness change inside the band becomes a request and the backlight stays at 543. Below the band the panel's own backlight takes over. **Dither correction** (Advanced, experimental) keeps the real backlight and corrects the band with per-step curves and dithering.
-- **Advanced:** the info overlay (lines in Steam's performance overlay: brightness against the maximum, what the correction does and why, dither tables, lift, crush), ReShade on/off, Steam's menus, dither in Steam's UI, random
+- **Top of the panel:** Correction, brightness slider and presets, **Test pattern**, **Info overlay** (lines in Steam's performance overlay: brightness against the maximum, what the correction does and why, dither tables, lift, crush), then **Simple view**, which hides everything below it.
+- **Advanced:** ReShade on/off, Steam's menus, dither in Steam's UI, random
   brightness, profiles (New / Copy / Rename / Delete;
   Factory stays read-only), export and import.
 
@@ -71,8 +72,7 @@ with sudo (see the script). Or install a packaged zip through Decky's
 developer settings: **Install plugin from ZIP**.
 
 **Lite package** (`scripts/package-lite.sh`): the plugin with a bundled
-profile, with the panel's groups folded. For sharing a calibration with
-other Portals.
+profile; the panel opens in Simple view (`simple`). For sharing a calibration with other Portals.
 
 ## Calibrating with a camera
 

@@ -15,7 +15,7 @@ import {
   staticClasses,
 } from "@decky/ui";
 import { definePlugin, routerHook } from "@decky/api";
-import { ReactNode, useEffect, useState } from "react";
+import { ReactNode, useEffect, useRef, useState } from "react";
 import { FaPalette } from "react-icons/fa";
 
 import { CALIBRATE_ROUTE, Calibrate } from "./Calibrate";
@@ -52,12 +52,15 @@ import {
   getSnap,
   setBandSnap,
   setOsd,
+  setSimple,
   setDimming,
   setSoftTarget,
   sliderLog,
   ownWrite,
   cancelBrightness,
   setRealSetter,
+  setEnabledSetter,
+  switchEnabled,
   setDirect,
   rawFor,
 } from "./backend";
@@ -163,12 +166,18 @@ function demoBrightness(b: number, set: (b: number) => void) {
   if (b >= SOFT_FROM && b < demoSoft.floor) {
     if (demoSoft.last && Math.abs(Math.log(b / demoSoft.last)) < Math.log(1.08)) return;
     demoSoft.last = b;
-    setSoftTarget(Math.round(b)).catch(() => {});
-    if (!demoSoft.atFloor) {
-      demoSoft.atFloor = true;
-      ownWrite.at = Date.now();
-      set(demoSoft.floor);
-    }
+    if (demoSoft.atFloor) return void setSoftTarget(Math.round(b)).catch(() => {});
+    // Up to the floor dimmed first, as crossUp (review 10-31 #5).
+    demoSoft.atFloor = true;
+    const token = demoSoft.token;
+    dimThenRaise(
+      () => Math.round(demoSoft.last),
+      () => demoSoft.on && demoSoft.atFloor && token === demoSoft.token,
+      () => {
+        ownWrite.at = Date.now();
+        set(demoSoft.floor);
+      },
+    );
   } else {
     demoSoft.atFloor = false;
     demoSoft.last = 0;
@@ -227,7 +236,16 @@ function tourTick(hold: number) {
   }
   if (!demo.compared && t >= TOUR_SETTLE + hold) {
     demo.compared = true;
-    compare(hold).catch(() => {});
+    if (demoSoft.on && demoSoft.atFloor) {
+      // Uncorrected is the panel at b, not the floor undimmed (review 10-31
+      // #2): the backlight drops first, the correction goes after (crossDown's
+      // order); the next step goes back up to the floor.
+      demoSoft.atFloor = false;
+      demoSoft.last = 0;
+      ownWrite.at = Date.now();
+      setRawBrightness(b, true);
+      setTimeout(() => demoTimer && compare(hold).catch(() => {}), handoverLag());
+    } else compare(hold).catch(() => {});
   }
   const phase = t < TOUR_SETTLE ? "settling" : t < TOUR_SETTLE + hold ? "corrected" : "uncorrected";
   const left = t < TOUR_SETTLE + hold ? TOUR_SETTLE + hold - t : stepLen - t;
@@ -261,8 +279,9 @@ function snapLater() {
       // Calibrating: the wizard sets its steps' own backlights; neither the
       // snap nor floor dimming may move them.
       if (c.calibrating) return;
+      const was = ayn.on;
       syncAyn(c);
-      if (ayn.on) soft = { floor: c.floor };
+      if (ayn.on && was) soft = { floor: c.floor }; // just came on: syncAyn takes it up
     } catch {
       /* keep the last known */
     }
@@ -310,23 +329,31 @@ async function softRequest(floor: number) {
   // intercept; reading the floor back as a request reset the target (and the
   // slider) to 543 after a drop inside the band.
   if (raw >= floor * 0.97) return;
-  await setSoftTarget(raw);
-  if (raw >= SOFT_FROM && raw < floor) {
-    snap.busy = true;
-    try {
-      await setRawBrightness(floor, true);
-      ownWrite.at = Date.now();
-    } finally {
-      snap.busy = false;
-    }
-  }
+  ayn.target = raw;
+  if (atFloor(raw)) {
+    // Up to the floor dimmed first (crossUp), not the floor undimmed until
+    // the backend's next round (review 10-31 #5).
+    ayn.lastF = guess(raw);
+    crossUp(ayn.lastF);
+  } else await setSoftTarget(raw);
 }
 
 // floor dimming intercept: Steam's SetBrightness wrapped, so a request inside
 // the band never reaches the panel (no flash through the band's bad mode);
 // it becomes the target and the backlight stays at the floor. Whether
 // Steam's slider then stays where it was put is what this tries out.
-const ayn = { holding: false, on: false, floor: 543, target: 0, pending: 0 as any, lastOut: 0, lastF: 0, floorAt: 0, checking: false };
+const ayn = {
+  holding: false,
+  on: false,
+  floor: 543,
+  target: 0,
+  pending: 0 as any,
+  lastOut: 0,
+  lastF: 0,
+  floorAt: 0,
+  checking: false,
+  switching: 0, // switchCorrection under way
+};
 
 // The backlight must sit at the floor for the dimming to be right (the
 // ladder only reaches gain ~0.05, the backend dims from "above the band").
@@ -339,7 +366,9 @@ async function ensureFloor() {
   try {
     const raw = await getBrightness();
     if (raw === null || !ayn.on) return;
-    if (raw < ayn.floor * 0.97 || raw > ayn.floor * 1.3) {
+    if (raw < ayn.floor * 0.97 && atFloor(ayn.target)) {
+      crossUp(ayn.lastF); // from below: dimmed first (review 10-31 #5)
+    } else if (raw < ayn.floor * 0.97 || raw > ayn.floor * 1.3) {
       ayn.floorAt = Date.now();
       ownWrite.at = Date.now();
       setDirect(guess(ayn.floor));
@@ -353,13 +382,73 @@ async function ensureFloor() {
 }
 
 // Whether floor dimming is in force now (the backend says: correction on, not
-// off for this game, not calibrating). Leaving it gives the asked-for
-// backlight back, else the screen would stay at the floor undimmed.
-function syncAyn(c: { dimming: string; floor: number; enabled: boolean; active?: boolean; calibrating: boolean }) {
+// off for this game, not comparing, not calibrating). Leaving it gives the
+// asked-for backlight back, else the screen would stay at the floor undimmed.
+// Coming back (the correction or the game back on, Compare over, a start with
+// the backlight left at the target) takes it up to the floor again, dimmed
+// first: it used to stay in the band, uncorrected, until the next slider move
+// (review 10-31 #1).
+function syncAyn(c: {
+  dimming: string;
+  floor: number;
+  enabled: boolean;
+  active?: boolean;
+  calibrating: boolean;
+  soft_target?: number | null;
+}) {
+  if (ayn.switching) return; // an answer from before the switch: switchCorrection reads again
   const was = ayn.on;
   ayn.floor = c.floor;
   ayn.on = c.dimming === "soft" && c.enabled && c.active !== false;
-  if (was && !ayn.on && !c.calibrating && !demoTimer) releaseAyn();
+  if (c.calibrating || demoTimer) return;
+  if (was && !ayn.on) releaseAyn();
+  else if (!was && ayn.on) enterFloor(c.soft_target ?? 0);
+}
+
+// The backend's target, not the frontend's copy: a camera run sets it in the
+// settings. Only from below the floor; a backlight above it stays a request.
+// Patient: after a restart the backend applies nothing for its first ~3 s
+// (READY_AFTER).
+async function enterFloor(target: number) {
+  const raw = await getBrightness();
+  if (raw === null || !ayn.on || raw >= ayn.floor * 0.97) return;
+  ayn.target = target || raw;
+  if (!atFloor(ayn.target)) return;
+  ayn.lastF = guess(ayn.target);
+  crossUp(ayn.lastF, 5000);
+}
+
+const syncNow = () =>
+  getSnap()
+    .then(syncAyn)
+    .catch(() => {});
+
+// Switching the correction (the Correction toggle, the Test pattern's Y, "Off
+// for <game>", Compare, the dimming method): going off in floor dimming, the
+// backlight drops to the target first and the backend lets go after, as
+// crossDown: a short dip, never the floor undimmed (review 10-31 #1, #2).
+// Then the new state is read at once instead of at the next aynWatch (2 s);
+// coming on, syncAyn takes the backlight up.
+async function switchCorrection<T>(change: () => Promise<T>, off: boolean): Promise<T> {
+  ayn.switching++;
+  try {
+    if (off && ayn.on && !demoTimer && atFloor(ayn.target)) {
+      ayn.on = false;
+      releaseAyn();
+      await new Promise((r) => setTimeout(r, handoverLag()));
+    }
+    return await change();
+  } finally {
+    ayn.switching--;
+    syncNow();
+  }
+}
+
+// Compare: the panel at the target, uncorrected, then back up when it ends.
+async function compareFor(seconds: number): Promise<State> {
+  const st = await switchCorrection(() => compare(seconds), true);
+  setTimeout(syncNow, seconds * 1000 + 100);
+  return st;
 }
 
 function releaseAyn() {
@@ -411,7 +500,7 @@ const HANDOVER_LAG = 60;
 // Camera runs can try other values without a build.
 const handoverLead = (): number => (window as any).OLED_HANDOVER_LEAD ?? HANDOVER_LEAD;
 const handoverLag = (): number => (window as any).OLED_HANDOVER_LAG ?? HANDOVER_LAG;
-function crossUp(f: number) {
+function crossUp(f: number, patience = 1500) {
   clearTimeout(softSend.timer);
   ayn.floorAt = Date.now(); // ensureFloor stays out of it
   ownWrite.at = Date.now();
@@ -423,17 +512,23 @@ function crossUp(f: number) {
     setTimeout(() => ayn.on && showOnSlider(f), 120);
     setTimeout(() => ayn.on && showOnSlider(f), 400);
   };
-  // Only once the backend says the dimming is on screen (its effect may still
-  // be waiting for the compile throttle); after 1.5 s the backlight rises anyway.
-  const until = Date.now() + 1500;
+  // The target back below meanwhile: the backlight stays.
+  dimThenRaise(() => ayn.target, () => atFloor(ayn.target), rise, patience);
+}
+
+// Only once the backend says the dimming is on screen (its effect may still
+// be waiting for the compile throttle); after `patience` ms the backlight
+// rises anyway.
+function dimThenRaise(target: () => number, still: () => boolean, rise: () => void, patience = 1500) {
+  const until = Date.now() + patience;
   const ask = () =>
-    setSoftTarget(ayn.target, "up").then(
+    setSoftTarget(target(), "up").then(
       (st: any) => {
-        if (!atFloor(ayn.target)) return; // back below meanwhile: the backlight stays
-        if (st?.soft_dimmed || Date.now() > until) setTimeout(() => atFloor(ayn.target) && rise(), handoverLead());
+        if (!still()) return;
+        if (st?.soft_dimmed || Date.now() > until) setTimeout(() => still() && rise(), handoverLead());
         else setTimeout(ask, 100);
       },
-      () => atFloor(ayn.target) && rise(),
+      () => still() && rise(),
     );
   ask();
 }
@@ -629,6 +724,7 @@ function Brightness({ brightness }: { brightness: number | null }) {
       <PanelSectionRow>
         <SliderField
           label={`Brightness ${brightness ?? "?"}`}
+          bottomSeparator="none" // the presets below belong to it; the line goes under them
           value={Math.round(guess(brightness ?? 40) * 100)}
           min={0}
           max={100}
@@ -640,9 +736,9 @@ function Brightness({ brightness }: { brightness: number | null }) {
         />
       </PanelSectionRow>
       <PanelSectionRow>
-        <Focusable style={{ display: "flex", gap: "6px" }} flow-children="horizontal">
+        <Focusable style={{ display: "flex", gap: "6px", marginTop: ROW_GAP }} flow-children="horizontal">
           {PRESETS.map((b) => (
-            <DialogButton key={b} style={{ minWidth: 0, flex: 1, padding: "0 4px" }} onClick={() => setRawBrightness(b)}>
+            <DialogButton key={b} style={{ ...TALL, minWidth: 0, flex: 1, padding: "0 4px" }} onClick={() => setRawBrightness(b)}>
               {b}
             </DialogButton>
           ))}
@@ -726,12 +822,27 @@ function Choice<T>({ label, value, options, onPick, disabled }: {
   );
 }
 
-function ButtonRow({ buttons }: { buttons: [string, () => void, boolean?][] }) {
+// The top of the panel (brightness presets, Test pattern / Info overlay):
+// taller buttons, so Simple view's line meets Steam's footer bar.
+const TALL = { height: "48px" };
+const ROW_GAP = "12px";
+
+function ButtonRow({ buttons, tall }: { buttons: [ReactNode, () => void, boolean?][]; tall?: boolean }) {
   return (
     <PanelSectionRow>
-      <Focusable style={{ display: "flex", gap: "6px" }} flow-children="horizontal">
-        {buttons.map(([text, run, disabled]) => (
-          <DialogButton key={text} disabled={disabled} style={{ minWidth: 0, flex: 1, padding: "0 4px" }} onClick={run}>
+      {tall && (
+        // the separator between the brightness presets and this row, centred
+        // in the gap, taking no height (like a field's own bottom line). The
+        // row's margin collapses out of it: this sits at the buttons' top.
+        <div style={{ position: "relative", height: 0 }}>
+          <div
+            style={{ position: "absolute", left: 0, right: 0, top: `calc(${ROW_GAP} / -2)`, height: "1px", background: "rgba(255, 255, 255, 0.1)" }}
+          />
+        </div>
+      )}
+      <Focusable style={{ display: "flex", gap: "6px", marginTop: tall ? ROW_GAP : undefined }} flow-children="horizontal">
+        {buttons.map(([text, run, disabled], i) => (
+          <DialogButton key={i} disabled={disabled} style={{ ...(tall ? TALL : {}), minWidth: 0, flex: 1, padding: "0 4px" }} onClick={run}>
             {text}
           </DialogButton>
         ))}
@@ -767,9 +878,34 @@ const go = (route: string) => {
   }, 150);
 };
 
+// Decky's plugin page is always ~80 px taller than the Quick Access view
+// (its content box is height 100% plus padding, under the title bar), so it
+// scrolls even when the panel fits. In Simple view the panel fits exactly
+// (Simple view's line on Steam's footer bar): drop that height and our
+// section's bottom margin while it's on, put them back after.
+function fitDeckyPanel(anchor: HTMLElement | null, on: boolean): (() => void) | undefined {
+  let section: HTMLElement | null = anchor?.parentElement ?? null;
+  let box: HTMLElement | null = section;
+  while (box && !(box.style.height === "100%" && box.style.paddingTop)) {
+    section = box;
+    box = box.parentElement;
+  }
+  if (!on || !box || !section) return;
+  const [height, margin] = [box.style.height, section.style.marginBottom];
+  box.style.height = "auto";
+  section.style.marginBottom = "0";
+  return () => {
+    box!.style.height = height;
+    section!.style.marginBottom = margin;
+  };
+}
+
 function Content() {
   const [state, setState] = useState<State | null>(null);
   const [note, setNote] = useState("");
+  const anchor = useRef<HTMLDivElement>(null);
+  const simple = !!state?.simple;
+  useEffect(() => fitDeckyPanel(anchor.current, simple), [simple, !!state]);
 
   useEffect(() => {
     let alive = true;
@@ -794,9 +930,14 @@ function Content() {
 
   return (
     <PanelSection>
+      <div ref={anchor} />
       <PanelSectionRow>
         <div style={{ fontSize: "13px", lineHeight: "18px" }}>
-          <div>
+          {/* always two lines: the rows below keep their place (Simple view's
+              line on Steam's footer bar) */}
+          <div
+            style={{ height: "36px", overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}
+          >
             <span style={{ color: STATUS_COLOUR[s.status.state] }}>●</span> {s.status.text}
           </div>
           <div style={{ opacity: 0.6, fontSize: "12px" }}>
@@ -819,20 +960,32 @@ function Content() {
         <ToggleField
           label="Correction"
           checked={s.enabled}
-          onChange={async (v) => {
-            setState(await setEnabled(v));
-            // floor dimming holds the backlight at its floor: off gives the
-            // asked-for brightness back (it stayed at the floor and looked
-            // "corrected"), on takes it up again.
-            if (s.dimming === "soft" && s.soft_target && s.soft_target >= SOFT_FROM && s.soft_target < s.soft_floor) {
-              ownWrite.at = Date.now();
-              await setRawBrightness(v ? s.soft_floor : s.soft_target, true);
-              ownWrite.at = Date.now();
-            }
-          }}
+          // floor dimming holds the backlight at its floor: off gives the
+          // asked-for brightness back (it stayed at the floor and looked
+          // "corrected"), on takes it up again (switchCorrection, syncAyn).
+          onChange={async (v) => setState(await switchCorrection(() => setEnabled(v), !v))}
         />
       </PanelSectionRow>
       <Brightness brightness={s.dimming === "soft" && s.soft_target ? s.soft_target : s.brightness} />
+      <ButtonRow
+        tall
+        buttons={[
+          ["Test pattern", () => go(PATTERN_ROUTE)],
+          [
+            <div style={{ lineHeight: "18px" }}>
+              Info overlay: {s.osd ? "on" : "off"}
+              <div style={{ fontSize: "11px", lineHeight: "14px", opacity: 0.7 }}>(in game only)</div>
+            </div>,
+            async () => setState(await setOsd(!s.osd)),
+          ],
+        ]}
+      />
+      {/* Simple view (Lite opens in it): everything below is hidden */}
+      <PanelSectionRow>
+        <ToggleField label="Simple view" checked={s.simple} onChange={async (v) => setState(await setSimple(v))} />
+      </PanelSectionRow>
+      {!s.simple && (
+      <>
       <PanelSectionRow>
         <DropdownItem
           label="Profile"
@@ -854,8 +1007,7 @@ function Content() {
       <ButtonRow
         buttons={[
           ["Calibrate", () => go(CALIBRATE_ROUTE)],
-          ["Test pattern", () => go(PATTERN_ROUTE)],
-          ["Compare", async () => setState(await compare(5)), !s.enabled],
+          ["Compare", async () => setState(await compareFor(5)), !s.enabled],
         ]}
       />
       {s.game && (
@@ -863,7 +1015,7 @@ function Content() {
           <ToggleField
             label={`Off for ${gameName}`}
             checked={s.game_off}
-            onChange={async (v) => setState(await setGameOff(v, gameName))}
+            onChange={async (v) => setState(await switchCorrection(() => setGameOff(v, gameName), v))}
           />
         </PanelSectionRow>
       )}
@@ -924,27 +1076,15 @@ function Content() {
           if (v === s.dimming) return; // picked again: keep the target (it was reset to the floor)
           const raw = s.brightness ?? s.soft_floor;
           if (v === "soft") {
-            setState(await setDimming("soft", raw));
-            if (raw >= SOFT_FROM && raw < s.soft_floor) {
-              ownWrite.at = Date.now(); // our own write: not a request (it reset the target to 543)
-              await setRawBrightness(s.soft_floor, true);
-              ownWrite.at = Date.now();
-            }
+            // The backlight goes up to the floor dimmed first (syncAyn).
+            setState(await switchCorrection(() => setDimming("soft", raw), false));
           } else {
             const back = s.dimming === "soft" ? (s.soft_target ?? raw) : raw;
-            setState(await setDimming("band", 0));
+            setState(await switchCorrection(() => setDimming("band", 0), true));
             await setRawBrightness(back, true);
           }
         }}
       />
-        <PanelSectionRow>
-          <ToggleField
-            label="Info overlay"
-            description="In Steam's performance overlay, over games: brightness, what the correction does and why."
-            checked={s.osd}
-            onChange={async (v) => setState(await setOsd(v))}
-          />
-        </PanelSectionRow>
         <PanelSectionRow>
           <ToggleField
             label="Fine correction (ReShade)"
@@ -1039,6 +1179,8 @@ function Content() {
           </div>
         </PanelSectionRow>
       </Group>
+      </>
+      )}
     </PanelSection>
   );
 }
@@ -1111,6 +1253,10 @@ export default definePlugin(() => {
   const display = SteamClient.System.Display as any;
   const original = display.SetBrightness.bind(display);
   setRealSetter(original);
+  setEnabledSetter((on) => switchCorrection(() => setEnabled(on), !on));
+  // For oled-measure's ui_smoke.py (over CDP): the sidebar's switches, the
+  // same way a press goes.
+  (window as any).OLEDTint = { correction: switchEnabled, compare: compareFor };
   display.SetBrightness = (f: number) => {
     const swallowed = aynIntercept(f);
     sliderLog(`F set ${f.toFixed(4)} raw ${rawFor(f)} ${swallowed ? "swallowed" : "passed"} target ${ayn.target}`).catch(() => {});
@@ -1138,6 +1284,8 @@ export default definePlugin(() => {
       brightness?.unregister();
       display.SetBrightness = original;
       setRealSetter((f) => SteamClient.System.Display.SetBrightness(f));
+      setEnabledSetter((on) => setEnabled(on));
+      delete (window as any).OLEDTint;
       clearTimeout(snap.timer);
       wizardEnd(); // never leave a calibration preview behind
     },

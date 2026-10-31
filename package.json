@@ -1,6 +1,6 @@
 {
   "name": "decky-oled-tint",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Decky plugin that corrects OLED green tint at low brightness using a per-brightness calibration curve.",
   "type": "module",
   "scripts": {

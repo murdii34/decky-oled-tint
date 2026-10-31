@@ -665,6 +665,9 @@ PASS = "pass"            # the gain that selects it
 # atom, the backlight follows Steam's call within ~1), so for this long the
 # backlight counts as already below the band.
 HANDOVER_WAIT = 1.0
+# Floor dimming going off: how long the dimming waits at most for the frontend
+# to drop the backlight from the floor (its poll is 2 s).
+LET_GO_WAIT = 3.0
 
 
 def gain_index(gain):
@@ -1388,6 +1391,7 @@ class Plugin:
         try:
             mtime = os.path.getmtime(self.settings_path)
         except OSError:
+            self.settings_error = None      # gone: nothing on disk left to keep
             return
         if mtime == self.settings_mtime:
             return
@@ -1445,6 +1449,7 @@ class Plugin:
                 profiles[new["profile"]] = copy.deepcopy(new["steps"])
             self.settings.update(new)
             self.settings_mtime = mtime
+            self.settings_error = None
             self.settings_base = copy.deepcopy(self.settings)
             self.revision += 1
             if not data.get("profiles") or stale:
@@ -1452,10 +1457,18 @@ class Plugin:
                 # behind its working steps: write it out now.
                 self._save_settings()
         except Exception as e:
-            decky.logger.error(f"Bad settings file, keeping current: {e}")
+            decky.logger.error(f"Bad settings file, keeping current, not writing it until it reads: {e}")
             self.settings_mtime = mtime
+            self.settings_error = str(e)
 
     def _save_settings(self):
+        if getattr(self, "settings_error", None):
+            # Unreadable on disk (a hand edit gone wrong): writing would replace
+            # it with what's in memory, at start the bare defaults, and the
+            # profiles and camera tables were gone (review 10-31 #4). Read
+            # again once fixed (new mtime) or deleted.
+            decky.logger.warning(f"settings not saved, the file doesn't read: {self.settings_error}")
+            return
         # The active profile follows every edit; Factory stays as it is.
         if self.settings["profile"] != FACTORY:
             self.settings["profiles"][self.settings["profile"]] = copy.deepcopy(self.settings["steps"])
@@ -1844,13 +1857,18 @@ class Plugin:
         self.backlight_now = shown or self._dither_key(raw, b)
         # floor dimming: the backlight held at the floor (by the frontend), the
         # picture dimmed to the requested level.
+        was_dimming = getattr(self, "soft_now", 1.0) < 1.0 and bool(self.applied)
         self.soft_now = 1.0
         self.soft_pass = False
         target = self.settings.get("soft_target")
         floor = floor_of(self.settings)
         soft = self.settings.get("dimming") == "soft" and not shown and raw
         going_down = time.monotonic() < getattr(self, "down_until", 0.0)
-        below = soft and (raw < SNAP_ZONE[0] or going_down) \
+        # The frontend about to raise the backlight to the floor from inside
+        # the band (floor dimming back on, Compare over, a start): dimmed for
+        # the floor first, as from below it (review 10-31 #5).
+        going_up = time.monotonic() < getattr(self, "up_until", 0.0) and raw < floor * 0.97
+        below = soft and (raw < SNAP_ZONE[0] or going_down or going_up) \
             and self.settings.get("engine", "reshade") == "reshade" and not self._app_effect()
         if soft and target and soft_wanted(target, floor) and raw >= floor * 0.97 and not going_down:
             # Dimmed from wherever the backlight is, as long as it's above
@@ -1870,6 +1888,18 @@ class Plugin:
         # every bin of the ramp was a new effect to compile (4 in 6 s, found by
         # the UI smoke test 2026-10-30); a slider drag stuttered.
         curves = self._target(self._bin(floor) if self.soft_now < 1.0 or self.soft_pass else b)
+        # Floor dimming going off (correction off, an "Off for <game>" game in
+        # front, Compare) with the backlight still at the floor: the dimming
+        # stays until the frontend has dropped the backlight to the target (it
+        # follows get_snap's "active" within 2 s), as crossDown: a short dip,
+        # never the floor undimmed. At most LET_GO_WAIT (no frontend).
+        holding = curves is None and soft and raw >= floor * 0.97 and self.soft_now < 1.0
+        if not holding:
+            self.letgo_from = None
+        elif getattr(self, "letgo_from", None) is None and was_dimming:
+            self.letgo_from = now
+        if holding and getattr(self, "letgo_from", None) is not None and now - self.letgo_from < LET_GO_WAIT:
+            curves = interpolate(self.settings["steps"], self._bin(floor))
         self.current, self.current_l, self.current_h = curves or (_neutral(),) * len(KINDS)
         if self.conflict:
             # Another look (e.g. a Steam colour filter) is active; stay out of
@@ -2033,6 +2063,8 @@ class Plugin:
         """What the correction does right now, and if nothing, why: one line
         for the top of the sidebar. state: on / off / paused."""
         compare = getattr(self, "compare_until", 0.0) - time.monotonic()
+        if getattr(self, "settings_error", None):
+            return {"state": "paused", "text": "settings.json doesn't read: changes not saved"}
         if self.preview is not None:
             return {"state": "on", "text": "Calibrating"}
         if not self.settings["enabled"]:
@@ -2229,12 +2261,19 @@ class Plugin:
     async def get_snap(self):
         """The band-edge snap's switch and zone, read fresh by the frontend
         before every snap (the camera tool switches it off for its runs), and
-        the dimming mode (floor dimming takes brightness changes as requests)."""
+        the dimming mode (floor dimming takes brightness changes as requests).
+        active: floor dimming holds the backlight now; not while comparing (the
+        frontend shows the panel at the target then, review 10-31 #2).
+        soft_target: the backend's, for the frontend to take back up after a
+        pause (a camera run sets it in the file)."""
         self._load_settings()
         return {"on": self.settings.get("band_snap", True), "zone": list(SNAP_ZONE),
                 "dimming": self.settings.get("dimming", "soft"), "floor": floor_of(self.settings),
                 "calibrating": self.preview is not None, "enabled": bool(self.settings["enabled"]),
-                "active": bool(self.settings["enabled"]) and not getattr(self, "unsupported", None) and self._game() not in (self.settings.get("app_off") or {})}
+                "active": bool(self.settings["enabled"]) and not getattr(self, "unsupported", None)
+                and self._game() not in (self.settings.get("app_off") or {})
+                and time.monotonic() >= getattr(self, "compare_until", 0.0),
+                "soft_target": self.settings.get("soft_target")}
 
     async def set_dimming(self, mode: str, target: int = 0):
         """"band" (our correction) or "soft" (floor dimming); target: the
@@ -2264,6 +2303,12 @@ class Plugin:
         self._save_settings()
         self.fast_until = asyncio.get_event_loop().time() + 3
         self.down_until = time.monotonic() + HANDOVER_WAIT if handover == "down" else 0.0
+        if handover == "up":
+            # Asked again every 100 ms until dimmed; a slider push meanwhile
+            # keeps it (the backlight is still on its way up).
+            self.up_until = time.monotonic() + HANDOVER_WAIT
+        elif handover == "down":
+            self.up_until = 0.0
         if handover in ("up", "down"):
             self._refresh()
         self.wake.set()
@@ -2323,12 +2368,14 @@ class Plugin:
         """Whether the look should cover the menus now: the menu state, held
         long enough, and not switching more often than ENGINE_SWITCH_GAP."""
         if not self.settings.get("menu_correction", True) or getattr(self, "safe_mode", False):
+            self.menu_look = False      # else a stale one holds the vibrance (review 10-31 #3)
             return False
         if self.settings.get("dimming") == "soft":
             # floor dimming: the dimming is the ReShade ladder, which follows the
             # game behind a menu. The look isn't applied there (tested
             # 2026-10-26: a 30% table over a game with the sidebar open
             # changed nothing), so switching to it froze the dimming.
+            self.menu_look = False
             return False
         want, since = getattr(self, "overlay_open", False), getattr(self, "overlay_since", 0.0)
         if want and time.monotonic() - getattr(self, "overlay_seen", since) > MENU_STALE:

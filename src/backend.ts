@@ -38,7 +38,7 @@ export interface State {
   snap_zone: [number, number]; // that edge, raw backlight, inclusive
   safe_mode: boolean; // gamescope stalled repeatedly: dither and menu switching paused
   dither_ui: boolean; // dither in Steam's own UI too (still there, so it can show as grain)
-  simple: boolean; // Lite package: just the on/off switch
+  simple: boolean; // Simple view: hides everything below its switch (Lite opens in it)
   dither_ready: boolean; // camera tables exist for at least one step
   max_crush: number;
   profiles: string[]; // "Factory" first: no correction, never edited
@@ -50,6 +50,13 @@ export interface State {
 
 export const getState = callable<[], State>("get_state");
 export const setEnabled = callable<[enabled: boolean], State>("set_enabled");
+// The Correction switch with floor dimming's backlight hand-over around it
+// (index.tsx installs it; the Test pattern can't import index).
+let enabledSetter: (on: boolean) => Promise<State> = (on) => setEnabled(on);
+export function setEnabledSetter(f: (on: boolean) => Promise<State>) {
+  enabledSetter = f;
+}
+export const switchEnabled = (on: boolean) => enabledSetter(on);
 // profile: the one the edits were made in (the backend drops them if another
 // is active now). accepted false: dropped, the page must reload; created:
 // editing Factory started this profile.
@@ -194,7 +201,16 @@ export const setSimple = callable<[on: boolean], State>("set_simple");
 export const setOsd = callable<[on: boolean], State>("set_osd");
 export const getSnap = callable<
   [],
-  { on: boolean; zone: [number, number]; dimming: "band" | "soft"; floor: number; calibrating: boolean; enabled: boolean }
+  {
+    on: boolean;
+    zone: [number, number];
+    dimming: "band" | "soft";
+    floor: number;
+    calibrating: boolean;
+    enabled: boolean;
+    active: boolean; // floor dimming holds the backlight now (not while comparing)
+    soft_target: number | null;
+  }
 >(
   "get_snap",
 );
